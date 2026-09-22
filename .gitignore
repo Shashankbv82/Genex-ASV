@@ -1,0 +1,39 @@
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# Python caches and bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Logs and runtime artifacts
+*.log
+backend.log
+*.tmp*
+*.pid
+.lgd-nfy*
+data/
+
+# Environment files and secrets
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+id_rsa*
+*.pub
+
+# Node / frontend dependencies and build
+node_modules/
+dist/
+dist-ssr/
+
+# OS and editor files
+.DS_Store
+*.swp
+*.swo
+*~

@@ -1,0 +1,24 @@
+{
+  "var_raw_pos": 20.2344,
+  "var_filt_pos": 23.9035,
+  "std_raw_pos": 4.498,
+  "std_filt_pos": 4.889,
+  "mean_raw_spd": 0.463,
+  "mean_filt_spd": 0.888,
+  "var_raw_spd": 0.515,
+  "var_filt_spd": 0.2975,
+  "max_raw_spd": 2.6,
+  "max_filt_spd": 2.49,
+  "rms_disp_raw": 7.653,
+  "rms_disp_filt": 10.132,
+  "max_disp_raw": 21.442,
+  "max_disp_filt": 22.67,
+  "mode_counts": {
+    "moving": 673,
+    "stationary": 227
+  },
+  "mode_transitions": 40,
+  "total_accepted": 183,
+  "total_rejected": 0,
+  "pct_nonzero_speed": 98.2
+}

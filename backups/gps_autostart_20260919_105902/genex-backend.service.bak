@@ -1,0 +1,29 @@
+[Unit]
+Description=GENEX ASV - Telemetry and GPS Backend Service
+After=network.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=southpolexp1
+Group=dialout
+WorkingDirectory=/home/southpolexp1/genex_asv
+# Bind 0.0.0.0 so Tailscale/LAN clients can reach the API (not public internet).
+ExecStart=/home/southpolexp1/genex_asv/venv/bin/uvicorn backend.main:app --host 0.0.0.0 --port 8000
+Restart=always
+RestartSec=3
+Environment="PYTHONUNBUFFERED=1"
+Environment="PATH=/home/southpolexp1/genex_asv/venv/bin:/usr/local/bin:/usr/bin:/bin"
+Environment="GENEX_GPS_PORT=/dev/ttyS0"
+Environment="GENEX_GPS_BAUD=115200"
+Environment="GENEX_API_HOST=0.0.0.0"
+Environment="GENEX_API_PORT=8000"
+
+# Sandboxing and security
+ProtectHome=read-only
+ReadWritePaths=/home/southpolexp1/genex_asv
+ProtectSystem=full
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

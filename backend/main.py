@@ -1,0 +1,263 @@
+"""
+GENEX ASV - Main Backend API & WebSocket Server
+"""
+
+import asyncio
+import logging
+import os
+import time
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
+from pydantic import BaseModel
+
+from backend.config import settings
+from backend.gps.reader import gps_reader
+from backend.gps.filter import gps_filter
+from backend.imu.reader import imu_reader
+from backend.safety.safety_manager import safety_manager
+from backend.rc.reader import rc_reader
+from backend.control.manual_controller import manual_controller
+from backend.system_monitor import get_system_health
+from backend.telemetry.state import ASVTelemetry, GPSData, SystemHealth, IMUData, SafetyStatus, RCStatus, ManualControlStatus, MotorStatus
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+)
+logger = logging.getLogger("genex.backend")
+
+# Active WebSocket connections
+active_websockets: list[WebSocket] = []
+current_operating_mode = "manual"
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup: start Safety Manager, GPS reader, IMU reader, RC reader, Manual Controller, and broadcaster
+    logger.info("Starting GENEX ASV Backend Services...")
+    safety_manager.register_get_operating_mode_callback(lambda: current_operating_mode)
+    def on_mode_revert():
+        global current_operating_mode
+        current_operating_mode = "manual"
+    safety_manager.register_mode_revert_callback(on_mode_revert)
+    safety_manager.start()
+
+    gps_reader.start_reader()
+    imu_reader.start_reader()
+    rc_reader.start()
+    manual_controller.start()
+
+    broadcast_task = asyncio.create_task(telemetry_broadcaster())
+    yield
+    # Shutdown
+    logger.info("Stopping GENEX ASV Backend Services...")
+    broadcast_task.cancel()
+    manual_controller.stop()
+    rc_reader.stop()
+    safety_manager.stop()
+    imu_reader.stop_reader()
+    gps_reader.stop_reader()
+
+app = FastAPI(title="GENEX ASV Backend API", version="1.0.0", lifespan=lifespan)
+
+# Enable CORS for frontend development server
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+class ModeRequest(BaseModel):
+    mode: str
+
+@app.get("/api/health", response_model=SystemHealth)
+async def api_health():
+    return get_system_health()
+
+@app.get("/api/gps", response_model=GPSData)
+async def api_gps():
+    return gps_reader.get_state()
+
+@app.get("/api/imu", response_model=IMUData)
+async def api_imu():
+    return imu_reader.get_state()
+
+@app.get("/api/safety/status", response_model=SafetyStatus)
+async def api_safety_status():
+    return safety_manager.get_status()
+
+@app.post("/api/safety/reset")
+async def api_safety_reset():
+    try:
+        res = safety_manager.reset_estop()
+        return res
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/telemetry", response_model=ASVTelemetry)
+async def api_telemetry():
+    gps = gps_reader.get_state()
+    filtered = gps_filter.get_filtered_position()
+    imu = imu_reader.get_state()
+    sys_health = get_system_health()
+    safety = safety_manager.get_status()
+    rc = rc_reader.get_status()
+    manual_ctrl = manual_controller.get_manual_status()
+    motors = manual_controller.get_motor_status()
+    return ASVTelemetry(
+        operating_mode=current_operating_mode,
+        gps=gps,
+        filtered=filtered,
+        imu=imu,
+        system=sys_health,
+        safety=safety,
+        rc=rc,
+        manual_control=manual_ctrl,
+        motors=motors
+    )
+
+
+@app.get("/api/latency")
+async def api_latency():
+    from backend.control.latency_tracker import latency_tracker
+    return latency_tracker.get_statistics()
+
+
+@app.post("/api/mode")
+async def set_operating_mode(req: ModeRequest):
+    global current_operating_mode
+    if req.mode == "semi_autonomous":
+        if safety_manager.is_estop_active():
+            logger.warning("Autonomous mode transition blocked: Obstacle E-stop is active/latched.")
+            return {
+                "status": "error",
+                "message": "Autonomous mode locked: Active Obstacle E-stop must be cleared and reset first."
+            }
+        gps = gps_reader.get_state()
+        if not (gps.connected and gps.position_source == "live" and gps.live_fix_valid and not gps.is_stale):
+            logger.warning("Autonomous mode transition blocked: Live GPS fix is invalid or cached (position_source=%s, live_valid=%s)",
+                           gps.position_source, gps.live_fix_valid)
+            return {
+                "status": "error",
+                "message": "Autonomous mode locked: Requires valid LIVE GPS fix. Cached positions cannot be used for navigation."
+            }
+        current_operating_mode = "semi_autonomous"
+        logger.info("Switched operating mode to: semi_autonomous")
+        return {"status": "ok", "mode": current_operating_mode}
+    elif req.mode == "manual":
+        current_operating_mode = "manual"
+        logger.info("Switched operating mode to: manual")
+        return {"status": "ok", "mode": current_operating_mode}
+    return {"status": "error", "message": "Invalid mode. Must be manual or semi_autonomous"}
+
+@app.websocket("/ws/telemetry")
+async def websocket_telemetry_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    active_websockets.append(websocket)
+    logger.info("WebSocket client connected. Active clients: %d", len(active_websockets))
+    try:
+        while True:
+            # Keep connection alive; handle any client messages/pings
+            msg = await websocket.receive_text()
+    except WebSocketDisconnect:
+        pass
+    finally:
+        if websocket in active_websockets:
+            active_websockets.remove(websocket)
+        logger.info("WebSocket client disconnected. Remaining clients: %d", len(active_websockets))
+
+async def telemetry_broadcaster():
+    """Broadcasts telemetry state to all connected WebSockets at configured Hz."""
+    interval = 1.0 / settings.TELEMETRY_BROADCAST_RATE_HZ
+    last_gps_utc = None
+    last_gps_mono = 0.0
+    while True:
+        try:
+            t_now = time.monotonic()
+            gps = gps_reader.get_state()
+
+            # Detect fresh GNSS measurement from GPSReader
+            # Safety isolation: only trigger Kalman filter update if measurement is an authentic LIVE fix
+            is_new_fix = False
+            if gps.connected and gps.position_source == "live" and gps.live_fix_valid:
+                if gps.timestamp_utc and gps.timestamp_utc != last_gps_utc:
+                    is_new_fix = True
+                    last_gps_utc = gps.timestamp_utc
+                    last_gps_mono = gps.last_update_monotonic
+                elif gps.last_update_monotonic > 0 and gps.last_update_monotonic != last_gps_mono:
+                    is_new_fix = True
+                    last_gps_mono = gps.last_update_monotonic
+
+            if is_new_fix:
+                gps_filter.update(gps, t_now)
+
+            # Autonomous failsafe: if live GPS is lost or Obstacle E-stop is active, revert to manual
+            global current_operating_mode
+            if current_operating_mode == "semi_autonomous":
+                if safety_manager.is_estop_active():
+                    current_operating_mode = "manual"
+                    logger.warning("Autonomous safety failsafe triggered: Obstacle E-stop active. Reverted to manual mode.")
+                elif not gps.live_fix_valid or gps.position_source != "live":
+                    current_operating_mode = "manual"
+                    logger.warning("Autonomous safety failsafe triggered: Live GPS fix lost. Reverted to manual mode.")
+            # Advance filter prediction to current 5 Hz tick
+            gps_filter.predict_to(t_now)
+            filtered = gps_filter.get_filtered_position()
+
+            if active_websockets:
+                sys_health = get_system_health()
+                imu = imu_reader.get_state()
+                safety = safety_manager.get_status()
+                rc = rc_reader.get_status()
+                manual_ctrl = manual_controller.get_manual_status()
+                motors = manual_controller.get_motor_status()
+                telem = ASVTelemetry(
+                    operating_mode=current_operating_mode,
+                    gps=gps,
+                    filtered=filtered,
+                    imu=imu,
+                    system=sys_health,
+                    safety=safety,
+                    rc=rc,
+                    manual_control=manual_ctrl,
+                    motors=motors
+                )
+                payload = telem.model_dump_json()
+
+                
+                # Send to all connected sockets
+                disconnected = []
+                for ws in active_websockets:
+                    try:
+                        await ws.send_text(payload)
+                    except Exception:
+                        disconnected.append(ws)
+                        
+                for ws in disconnected:
+                    if ws in active_websockets:
+                        active_websockets.remove(ws)
+                        
+            await asyncio.sleep(interval)
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error("Error in telemetry broadcaster: %s", e)
+            await asyncio.sleep(1.0)
+
+# Serve production frontend if built
+dist_dir = os.path.join(os.path.dirname(__file__), "../frontend/dist")
+if os.path.exists(dist_dir):
+    app.mount("/assets", StaticFiles(directory=os.path.join(dist_dir, "assets")), name="assets")
+
+    @app.get("/{full_path:path}")
+    async def serve_spa(full_path: str):
+        index_file = os.path.join(dist_dir, "index.html")
+        if os.path.exists(index_file):
+            return FileResponse(index_file)
+        return {"status": "ok", "message": "Frontend build in progress or dist/index.html not found."}
